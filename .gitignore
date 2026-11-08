@@ -1,10 +1,20 @@
 # build artefacts
-/target/
-**/*.rs.bk
+/build/
+/player
+*.o
+*.d
 __pycache__/
 *.pyc
+
+# test binaries
+tests/run.bin
 
 # local state
 *.db
 *.db-journal
 /.player/
+
+# generated fixtures (regenerate with: sh tools/mkfixtures.sh)
+tests/fixtures/*.mp4
+tests/fixtures/*.flac
+tests/fixtures/*.mkv
