@@ -1,0 +1,10 @@
+# build artefacts
+/target/
+**/*.rs.bk
+__pycache__/
+*.pyc
+
+# local state
+*.db
+*.db-journal
+/.player/
