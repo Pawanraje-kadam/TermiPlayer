@@ -18,6 +18,7 @@
 #include "decode.h"
 #include "gfx.h"
 #include "gfx_internal.h"
+#include "library.h"
 #include "raster.h"
 #include "term.h"
 #include "testsrc.h"
@@ -61,7 +62,31 @@ typedef struct {
     double  duration;
 
     SessionOpts opt;
+
+    /* The library is optional here: `player FILE` should remember where you
+     * stopped exactly like the TUI does, or "resume" would be a lie for anyone
+     * who plays from the shell. Failures are non-fatal. */
+    Library *lib;
+    Entry   *entry;
+    int64_t  last_save_ns;
 } Session;
+
+#define AUDIO_RATE DECODE_AUDIO_RATE
+
+/* ------------------------------------------------------------------ */
+/* library (optional)                                                 */
+/* ------------------------------------------------------------------ */
+
+static void session_data_dir(char *out, size_t cap)
+{
+    const char *env = getenv("TERMIPLAYER_DATA");
+    if (env && *env) { snprintf(out, cap, "%s", env); return; }
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) { snprintf(out, cap, "%s/termiplayer", xdg); return; }
+    const char *home = getenv("HOME");
+    if (home && *home) { snprintf(out, cap, "%s/.local/share/termiplayer", home); return; }
+    snprintf(out, cap, "./.termiplayer");
+}
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
@@ -249,6 +274,16 @@ static void cleanup(Session *s)
     raster_free(&s->out);
     if (s->dec) decode_close(s->dec);
     if (s->audio) audio_close(s->audio);
+    if (s->lib) {
+        if (s->entry) {
+            double pos = s->clock ? clock_position(s->clock) : 0;
+            bool finished = s->duration > 0 && pos >= s->duration - 2.0;
+            if (finished) lib_set_finished(s->lib, s->entry);
+            else if (pos > 1.0) lib_set_position(s->lib, s->entry, pos, s->duration);
+        }
+        lib_flush(s->lib);
+        lib_close(s->lib);
+    }
     clock_free(s->clock);
     tp_free(s->tp);
     if (s->term) term_close(s->term);
@@ -330,17 +365,60 @@ int session_run(const SessionOpts *o)
         }
     }
 
+    /* ---- library: resume support for the one-shot path ---- */
+    if (!o->testsrc && o->path && !o->no_resume) {
+        char ddir[1024];
+        session_data_dir(ddir, sizeof ddir);
+        s.lib = lib_open(ddir, mi.ffmpeg_path);
+        if (s.lib) s.entry = lib_touch(s.lib, o->path);
+    }
+
     /* ---- clock ---- */
-    if (o->start_at > 0) clock_seek(s.clock, o->start_at, now_ns());
+    double resume_at = o->start_at;
+    if (resume_at <= 0 && s.entry && s.entry->position > 5.0 &&
+        (s.duration <= 0 || s.entry->position < s.duration - 10.0)) {
+        resume_at = s.entry->position;
+        if (!o->quiet) {
+            gfx_cursor(&s.w, s.ti.rows, 1);
+            buf_printf(&s.w.b, "\x1b[0m\x1b[2mresuming at %.0f s\x1b[0m", resume_at);
+            ttyw_flush(&s.w);
+        }
+    }
+    /* Order matters: start_monotonic zeroes the clock, so any seek must come
+     * after it. Getting this backwards silently disabled resume. */
     clock_start_monotonic(s.clock, now_ns());
+    if (resume_at > 0) {
+        clock_seek(s.clock, resume_at, now_ns());
+        if (s.dec) {
+            char serr[256];
+            if (decode_seek(s.dec, resume_at, serr, sizeof serr) != 0)
+                warnx_("could not resume: %s", serr);
+        }
+    }
+    /* Initialise the audio reference at the position we actually start from.
+     * Passing 0 here unconditionally was the second half of the resume bug: it
+     * ran after the seek and dragged the clock back to zero. */
     if (s.audio && audio_available(s.audio))
-        clock_set_audio_position(s.clock, 0, DECODE_AUDIO_RATE, now_ns());
+        clock_set_audio_position(s.clock,
+                                 (int64_t)(resume_at * (double)DECODE_AUDIO_RATE),
+                                 DECODE_AUDIO_RATE, now_ns());
 
     s.t0_ns = now_ns();
     s.last_stat_ns = s.t0_ns;
 
     /* ---- the loop ---- */
+    /* The presentation timestamp of a decoded frame is its index divided by the
+     * source frame rate. Using the clock position as the PTS made every frame
+     * look perfectly in sync (diff == 0), so the pacer never waited and the
+     * whole clip decoded as fast as ffmpeg could produce it. */
+    double play_fps = mi.src_fps > 1.0 ? mi.src_fps : 0.0;
     int frame_no = 0;
+    /* Where the current decode stream starts. After a resume or a seek the
+     * first frame out of ffmpeg is at that timestamp, not at zero, so PTS has to
+     * be offset by it -- otherwise the pacer re-bases the clock to 0 and the
+     * resume is silently undone one loop later. */
+    double pts_base = resume_at > 0 ? resume_at : 0.0;
+    const double start_pos = pts_base;
     double seek_to = -1;
 
     while (s.running) {
@@ -362,24 +440,17 @@ int session_run(const SessionOpts *o)
             clock_seek(s.clock, seek_to, now_ns());
             clock_set_paused(s.clock, false, now_ns());
             s.paused = false;
+            pts_base = seek_to;
+            frame_no = 0;
             if (s.audio) audio_flush(s.audio);
             if (s.dec) {
-                /* Re-open at the new position: a clean seek without buffering
-                 * a whole GOP, and it works for both pipes at once. */
                 char err[256];
-                char *old = xstrdup(s.opt.path);
-                decode_close(s.dec);
-                s.dec = NULL;
-                MediaInfo mi2;
-                /* Build a seek-capable reopen by prefixing -ss is not possible
-                 * through this API; instead we let ffmpeg seek on the next
-                 * open and ask it to skip. */
-                s.dec = decode_open(old, !s.opt.no_video, !s.opt.no_audio,
-                                    &mi2, err, sizeof err);
-                free(old);
-                if (!s.dec) { s.running = false; warnx_("seek failed: %s", err); break; }
-                s.video_done = false;
-                s.audio_done = false;
+                if (decode_seek(s.dec, seek_to, err, sizeof err) != 0) {
+                    warnx_("seek failed: %s", err);
+                } else {
+                    s.video_done = false;
+                    s.audio_done = false;
+                }
             }
             seek_to = -1;
             now = now_ns();
@@ -392,7 +463,10 @@ int session_run(const SessionOpts *o)
 
         /* 4. duration limit / end conditions */
         double pos = clock_position(s.clock);
-        if (s.opt.duration_limit > 0 && pos >= s.opt.duration_limit) break;
+        /* -d means "play for N seconds", not "stop at timestamp N", so it is
+         * measured from wherever playback started. Comparing it against the
+         * absolute position made "-t 30 -d 5" exit before the first frame. */
+        if (s.opt.duration_limit > 0 && pos >= start_pos + s.opt.duration_limit) break;
         if (s.duration > 0 && pos >= s.duration + 0.5) break;
 
         /* 5. pacing: how long may we sleep before the next frame is due? */
@@ -407,7 +481,16 @@ int session_run(const SessionOpts *o)
         }
 
         /* 6. decide whether this frame is worth drawing */
-        double pts = s.dec ? pos : (double)frame_no / (double)(o->target_fps ? o->target_fps : 30);
+        double out_fps = (double)(o->target_fps ? o->target_fps : 30);
+        /* PTS must come from the *content*, not from the clock: the clock is
+         * what we are trying to synchronise against. */
+        double pts;
+        if (s.dec) {
+            double rate = play_fps > 0 ? play_fps : out_fps;
+            pts = pts_base + (double)frame_no / rate;
+        } else {
+            pts = (double)frame_no / out_fps;
+        }
         FrameDecision d = clock_decide(s.clock, pts, now, frame_ns);
 
         if (d.action == ACT_HOLD) {
@@ -518,6 +601,12 @@ int session_run(const SessionOpts *o)
 
         frame_no++;
         s.frames_shown++;
+
+        /* 9b. persist the resume point, debounced */
+        if (s.entry && now - s.last_save_ns > 3000000000LL) {
+            lib_set_position(s.lib, s.entry, clock_position(s.clock), s.duration);
+            s.last_save_ns = now;
+        }
 
         /* 10. HUD, cheap and only when it changed meaningfully */
         if (!o->quiet && (s.frames_shown % 10) == 0) {

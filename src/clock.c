@@ -103,6 +103,7 @@ void clock_start_monotonic(Clock *c, int64_t now_ns)
     c->speed = c->speed > 0 ? c->speed : 1.0;
 }
 
+
 double clock_position_raw(const Clock *c)
 {
     if (c->paused) {

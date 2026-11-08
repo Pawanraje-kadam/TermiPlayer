@@ -247,9 +247,14 @@ util, raster, base64, raster size, backends, clock, throughput, testsrc, term
 ```
 
 ```
-cli, backends emit well-formed escapes, measured cost, media playback, hygiene
-25 checks, 0 failed
+cli, backends emit well-formed escapes, measured cost, media playback,
+library and resume, interactive player, hygiene
+40 checks, 0 failed
 ```
+
+The unit suite gained 55 checks for the player layer (`media` release-name
+parsing, `library` persistence and views, `screen` diff/geometry/ellipsis):
+**200 checks, 0 failed**.
 
 The integration suite skips (not fails) media tests when ffmpeg or fixtures are
 absent, so it is safe to run anywhere.
@@ -267,3 +272,48 @@ absent, so it is safe to run anywhere.
 
 Not yet measured (needs a real terminal): sustained fps per backend, A/V drift
 over a long clip, hwdec benefit.
+
+---
+
+## 9. The player layer: five bugs the tests now catch
+
+Building the library, queue and resume turned up bugs that no amount of reading
+the code would have shown. Each one is now pinned by a check.
+
+**1. Resume seeked the clock, not the decoder.** `clock_seek()` moved the
+timeline, but the `ffmpeg` child stayed at byte zero and nothing discarded
+frames: the UI claimed 40 minutes in and showed frame 1. Fixed by
+`decode_seek()`, which re-spawns the child with `-ss`. Verified by decoding a
+clip that is red for 20 s and blue after: `-t 2` must yield red, `-t 30` blue.
+
+**2. Two lines undid the seek, silently.** `clock_start_monotonic()` ran *after*
+the resume seek and zeroed it; then `clock_set_audio_position(0, ...)` zeroed it
+again. Both were one-liners in the right place doing the wrong thing. The audio
+reference now starts at the position we actually start from.
+
+**3. State rows for unindexed files were dropped.** `player movie.mkv` on a file
+outside a watched folder created an entry, saved `S	...`, and then threw the row
+away on load because it built state only for paths that already had an index row.
+Resume therefore worked only for library files. State lines now create entries.
+
+**4. PTS came from the clock, so nothing was ever paced.** `pts = clock_position()`
+makes every frame look perfectly in sync (`diff == 0`), so the pacer never waited
+and a 40-second clip played in two seconds and was marked watched. PTS must come
+from the content — frame index ÷ source frame rate — because the clock is what we
+are synchronising *against*. The integration suite now asserts that `-d 6` takes
+about six seconds of wall time, which is the check that would have caught it.
+
+**5. `frame_idx` was not incremented on the display path.** With (4) fixed, the
+TUI still burned through a file: the discard branch advanced the counter but the
+draw branch did not, so PTS froze after the first frame and every subsequent frame
+looked 1.2 s behind and was discarded. One missing `++`.
+
+Two smaller ones:
+
+- `toast()` stored a pointer to the caller's **stack buffer**; the message read
+  freed stack memory and usually rendered blank. It now owns a copy.
+- One file could exist twice in the library (relative and absolute paths), each
+  with its own resume point. Paths are canonicalised with `realpath()` at every
+  entry point.
+- `-d` was compared against the absolute position, so `-t 30 -d 5` exited before
+  the first frame. It now means "play for N seconds from the start point".

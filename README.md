@@ -4,19 +4,28 @@
 one small binary.
 
 ```bash
-player movie.mkv            # just play the thing
+player                      # open your library: browse, play, continue
+player add ~/Videos         # index a folder (run once)
+player continue             # what was I watching?
+player movie.mkv            # just play the thing (resumes too)
 player testsrc              # prove the render path, no media needed
 player probe                # what did we detect about this terminal, and why
 player doctor               # something looks wrong: ask me
 ```
 
-> **Status: M0–M2 complete and verified.** Video and audio play. Seven graphics
-> backends work. A/V sync uses an audio master clock. The adaptive throughput
-> controller makes real decisions. 145 unit + 25 integration checks pass,
-> including under ASan/UBSan.
+> **Status: works as a player.** A browsable library over watched folders, a
+> queue, and resume-where-you-left-off — so `player` with no arguments is
+> useful, not a renderer. Video and audio play through seven graphics backends,
+> A/V sync uses an audio master clock, and the adaptive throughput controller
+> makes real decisions. **200 unit + 40 integration checks pass**, including
+> under ASan/UBSan.
 >
-> **Not yet built:** the library, queue and resume (M3/M6) — the part that makes
-> it a *player* rather than a renderer. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> Resume is a real decoder seek (`ffmpeg -ss`), not a cosmetic clock offset, and
+> it is verified by decoding a clip whose colour changes at 20 s.
+>
+> **Not yet built:** playlists, subtitle rendering, time-shift seeking from the
+> library UI beyond 5 s steps, folder picking inside the TUI (`player add DIR`
+> works). See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 >
 > Built in C, not the planned Rust: no Rust toolchain and no crates.io access in
 > the build environment. The reasoning, and what it cost, is in
@@ -42,7 +51,7 @@ and for audio *decoding*. Audio *output* needs nothing: it uses libpulse via
 `dlopen` when present and plays silently when not.
 
 ```bash
-make test            # 145 unit + 25 integration checks
+make test            # 200 unit + 40 integration checks
 make test-san        # the same, under ASan + UBSan
 sh tools/mkfixtures.sh   # generate the test media (needs ffmpeg)
 ```
@@ -59,33 +68,46 @@ None of them answer "I have 400 files, what do I watch next, and put me back whe
 
 ---
 
-## What it looks like (M3 target — the TUI is not built yet)
+## What it looks like
 
 ```
-┌ TermiPlayer ────────────────────────────── ── ♪ 03:12 / 1:47:38 ── Volume 72% ─┐
-│ LIBRARY › Films › Sci-Fi (18)                     │  BLADE RUNNER 2049           │
-│                                                    │  Denis Villeneuve · 2017      │
-│  ▸ Arrival                          2016   ✓ 87%  │  2h 43m · 4K HDR · HEVC      │
-│  ▸ Blade Runner 2049                2017   ✓ 100% │                              │
-│  ▸ Dune                             2021   ✓ 41%  │  ┌──────────────────────────┐│
-│  ▸ Dune: Part Two                   2024       —  │  │                          ││
-│  ▸ Ex Machina                       2014   ✓ 100% │  │      video renders        ││
-│  ▸ Interstellar                     2014   ✓ 12%  │  │      here at the          ││
-│                                                    │  │      terminal's real      ││
-│  QUEUE                                             │  │      pixel resolution     ││
-│  1. Dune: Part Two          ← next                 │  │                          ││
-│  2. Annihilation                                   │  └──────────────────────────┘│
-│  3. Sicario                                        │                              │
-├────────────────────────────────────────────────────┴──────────────────────────────┤
-│ ▁▂▃▅▇█▇▅▃▂▁  space pause · ←→ seek · j/k vol · s subs · f fullscreen · q quit     │
-└───────────────────────────────────────────────────────────────────────────────────┘
+┌ TermiPlayer ────────────────────────────────────────┬──────────────────────────────┐
+│ ┌ LIBRARY (12) ──────────────────────────────────┐  │ ┌ NOW PLAYING ──────────────┐│
+│ │ ▶ Dune 2021                          0:44:12   │  │ │                            ││
+│ │   Redblue                            0:40      │  │ │   actual decoded frames    ││
+│ │   Blade Runner 2049                  1:47:38   │  │ │   drawn into the pane,     ││
+│ │   Comfortably Numb (Pink Floyd)      0:06      │  │ │   at the terminal paint    ││
+│ │   …                                            │  │ │   size the backend chose   ││
+│ │                                                │  │ └────────────────────────────┘│
+│ │                                                │  │ ┌ QUEUE (2) ─────────────────┐│
+│ │                                                │  │ │ Dune 2021                  ││
+│ │                                                │  │ │ Redblue                    ││
+│ └────────────────────────────────────────────────┘  │ └────────────────────────────┘│
+├─────────────────────────────────────────────────────┴──────────────────────────────┤
+│ ↑↓ move  enter play  space pause  ←→ seek  n next  / filter  a add  r rescan  ? help │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-*This is a design mockup of the M3 interface, not a screenshot. The playback
-engine underneath it exists; the library views do not yet. What does exist right
-now renders at whatever your terminal can do — real pixels
-(kitty/WezTerm/Ghostty/iTerm2), sixel, or truecolor blocks — auto-detected, over
-ssh, inside tmux.*
+*Not a mockup: the layout adapts to the terminal width (library+preview+queue at
+≥100 columns, library+preview at ≥60, library only below), and the right pane is
+a real decoded frame, not a placeholder. Video renders at whatever the terminal
+can actually do — real pixels (kitty/WezTerm/Ghostty/iTerm2), sixel, or
+truecolor blocks — auto-detected, over ssh, inside tmux.*
+
+### The player keys
+
+| key | does |
+|---|---|
+| `↑` `↓` / `j` `k` | move in the library |
+| `enter` | play the selection (resumes where you stopped) |
+| `space` | pause / resume |
+| `←` `→` | seek 5 s · `pgup` `pgdn` seek 60 s |
+| `n` | next file in the queue |
+| `/` | filter as you type (multiple words, all must match) |
+| `Q` | add the selection to the queue, `c` clear it |
+| `a` | how to add a folder (`player add <dir>`) |
+| `r` | rescan watched folders |
+| `?` | full key list, `q` quit |
 
 ---
 
@@ -155,12 +177,24 @@ Numbers, method and the full results table: [`spikes/RESULTS.md`](spikes/RESULTS
 - `player probe` — every capability, and why each backend was taken or skipped
 - `player doctor` — the five things that actually break, checked and explained
 
+**The player layer**
+
+- `player` with no arguments opens the library; folders are indexed once and
+  rescanned on demand, with durations cached until a file's mtime/size changes
+- Filename parsing: `Dune.2021.1080p.WEB-DL.x264-GROUP` → `Dune 2021`,
+  `01 - Test Artist - A Song` → `A Song`
+- Resume: a real `ffmpeg -ss` seek, saved every 3 s and on quit, in both the TUI
+  and the one-shot path; `--no-resume` to ignore it
+- Queue with auto-advance, and a `continue` view of everything part-watched
+- Storage is human-readable TSV, written atomically
+
 ## Not built yet
 
 Straight answer, because the README should not oversell:
 
-- **The library, queue and resume** — the whole point of "a player, not a
-  renderer". M3/M6, not started.
+- **Playlists** (the queue is per-session; it is not persisted), and folder
+  picking from inside the TUI — you add folders with `player add <dir>`.
+- Variable-speed seeking beyond the 5 s / 60 s steps.
 - Subtitles, chapters (M4).
 - Gapless playback; speed control does not yet pitch-preserve audio.
 - Hardware decode (ffmpeg does it, we do not expose a flag yet).

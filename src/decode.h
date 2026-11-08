@@ -63,6 +63,10 @@ int decode_read_video(DecodeSource *d, Raster *r);
  * 0 at end of stream, -1 on error. */
 ssize_t decode_read_audio(DecodeSource *d, int16_t *buf, size_t max_samples);
 
+/* Seek to `seconds` by re-spawning the decoder with -ss (accurate seek).
+ * Returns 0 on success, -1 on failure (err filled). */
+int decode_seek(DecodeSource *d, double seconds, char *err, size_t errcap);
+
 /* Stop the ffmpeg process early (e.g. user quit). Safe to call twice. */
 void decode_kill(DecodeSource *d);
 

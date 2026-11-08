@@ -31,6 +31,7 @@ typedef struct {
     bool  quiet;               /* no HUD at all               */
     bool  loop;                /* restart at end              */
     double duration_limit;     /* stop after N seconds, 0=off */
+    bool   no_resume;          /* ignore a saved resume point */
 } SessionOpts;
 
 /* Returns process exit code. */

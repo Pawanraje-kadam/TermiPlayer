@@ -187,7 +187,149 @@ print(1 if any(b not in (0,) for b in d[:20000]) else 0)")
     [ $? -eq 0 ] && pass "-t seek starts mid-file and exits" || fail "seek run failed"
 fi
 
-# ---------------------------------------------------------------- 5. hygiene
+
+# ---------------------------------------------------------------- 5. library + resume
+echo
+echo "library and resume"
+export TERMIPLAYER_DATA="$TMP/data"
+rm -rf "$TERMIPLAYER_DATA"
+
+run $PLAYER add "$FIX" >/dev/null 2>&1
+[ $? -eq 0 ] && pass "add indexes a folder" || fail "add failed"
+[ -f "$TMP/data/index.tsv" ] && pass "index file written" \
+    || fail "no index.tsv after add"
+
+n=$(grep -c '^I' "$TMP/data/index.tsv" 2>/dev/null || echo 0)
+[ "$n" -ge 3 ] && pass "index holds $n entries" || fail "index holds only $n entries"
+
+# list must render human titles, not raw file names
+lsout=$($PLAYER list 2>/dev/null)
+echo "$lsout" | grep -q 'Tone' && pass "list shows a parsed title" \
+    || fail "list did not show a parsed title: $lsout"
+
+# a filter narrows the list
+alln=$(echo "$lsout" | grep -c . )
+fil=$($PLAYER list clip 2>/dev/null)
+filn=$(echo "$fil" | grep -c . )
+[ "$filn" -lt "$alln" ] && pass "filter narrows $alln -> $filn" \
+    || fail "filter did not narrow the list"
+
+# Playback must run at real time, not as fast as the decoder can go. redblue.mp4
+# is 40 s; playing it for ~6 s must land near 6 s, not at the end. This is the
+# check that would have caught the PTS bug (pts came from the clock, so every
+# frame looked in sync and nothing was ever paced).
+start=$(date +%s)
+timeout 20 $PLAYER "$FIX/redblue.mp4" -b ascii -q -s 20x10 -d 6 >/dev/null 2>&1
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -ge 5 ] && [ "$elapsed" -le 12 ] \
+    && pass "-d 6 takes about 6 s of wall time (${elapsed}s)" \
+    || fail "-d 6 took ${elapsed}s of wall time: playback is not paced"
+
+pos=$($PLAYER continue 2>/dev/null | awk 'tolower($0) ~ /redblue/ {gsub(/%/,"",$1); print $1; exit}')
+[ -n "$pos" ] && [ "$pos" -ge 5 ] && [ "$pos" -le 25 ] \
+    && pass "position after 6 s is ${pos}% of the file" \
+    || fail "position after 6 s was '${pos}%', expected roughly 15%"
+
+grep -q '^S' "$TMP/data/state.tsv" 2>/dev/null && pass "position persisted" \
+    || fail "no position persisted"
+
+# "continue" must surface the in-progress file
+$PLAYER continue 2>/dev/null | grep -qi 'redblue' && pass "continue lists the in-progress file" \
+    || fail "continue did not list the in-progress file"
+
+# Resume must actually move the decoder. redblue.mp4 is red for its first 20 s
+# and blue after, so the dominant escape-stream colour tells us where decoding
+# really started -- a cosmetic clock offset cannot fake this.
+# -d is a playback budget from the start point, so 0.4 s is enough to get frames
+dom_colour() {
+    $PLAYER "$FIX/redblue.mp4" -b blocks256 -q -s 12x6 -d 0.4 "$@" 2>/dev/null | python3 -c "
+import sys,re,collections
+d=sys.stdin.buffer.read().decode('utf8','replace')
+c=collections.Counter(re.findall(r'(?:38|48);5;(\d+)',d))
+print(c.most_common(1)[0][0] if c else 'none')"
+}
+c2=$(dom_colour -t 2)
+c30=$(dom_colour -t 30)
+[ "$c2" = "196" ] && pass "-t 2 decodes the red part (colour $c2)" \
+    || fail "-t 2 produced colour $c2, expected 196 (red)"
+[ "$c30" = "21" ] && pass "-t 30 decodes the blue part (colour $c30)" \
+    || fail "-t 30 produced colour $c30, expected 21 (blue)"
+
+# a saved position must be honoured: 3 s in, the frame is still red
+$PLAYER "$FIX/redblue.mp4" --no-resume -b ascii -q -s 8x4 -d 0.2 >/dev/null 2>&1
+[ $? -eq 0 ] && pass "--no-resume bypasses the saved position" || fail "--no-resume failed"
+
+# the player must refuse to start the TUI without a tty rather than hang
+timeout 10 $PLAYER tui < /dev/null > "$TMP/tui.out" 2>"$TMP/tui.err"
+rc=$?
+[ "$rc" -ne 124 ] && pass "tui without a tty exits instead of hanging (rc=$rc)" \
+    || fail "tui hung with no tty"
+
+
+# ---------------------------------------------------------------- 6. TUI player
+echo
+echo "interactive player"
+tui_run() {
+    # $1 = keys as "delay:bytes" pairs via python, $2 = timeout
+    python3 - "$PLAYER" "$TMP" <<'PY'
+import os, pty, sys, time, select, struct, fcntl, termios
+player, tmp = sys.argv[1], sys.argv[2]
+spec = os.environ.get("TUI_KEYS", "")
+keys = []
+for item in spec.split(",") if spec else []:
+    d, b = item.split(":", 1)
+    keys.append((float(d), b.encode().decode("unicode_escape").encode()))
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.environ["COLORTERM"] = "truecolor"
+    err = os.open(os.path.join(tmp, "tui_err"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.dup2(err, 2)
+    os.execv(player, [player, "tui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+limit = float(os.environ.get("TUI_TIMEOUT", "12"))
+t0 = time.time(); ki = 0; status = None
+while time.time() - t0 < limit:
+    while True:
+        r, _, _ = select.select([fd], [], [], 0)
+        if not r: break
+        try: d = os.read(fd, 1 << 16)
+        except OSError: d = b""
+        if not d: break
+    if ki < len(keys) and time.time() - t0 > keys[ki][0]:
+        os.write(fd, keys[ki][1]); ki += 1
+    wp, st = os.waitpid(pid, os.WNOHANG)
+    if wp: status = st; break
+if status is None:
+    os.kill(pid, 9); os.waitpid(pid, 0)
+    print("TIMEOUT")
+else:
+    print("EXIT %d" % ((status >> 8) & 0xFF))
+os.close(fd)
+PY
+}
+
+export TERMIPLAYER_DATA="$TMP/tuidata"
+rm -rf "$TERMIPLAYER_DATA"
+$PLAYER add "$FIX" >/dev/null 2>&1
+
+# The TUI must open, and must quit; a hung UI is worse than a crash.
+out=$(TUI_KEYS="1.5:q" TUI_TIMEOUT=8 tui_run)
+case "$out" in
+    "EXIT 0") pass "TUI opens and quits on q" ;;
+    *)        fail "TUI did not exit cleanly: $out" ;;
+esac
+
+# Playback in the TUI must run at real time and persist a resume point. This is
+# the test that catches the pacing bug: the pane used to burn through the whole
+# file in a couple of seconds and mark it watched.
+out=$(TUI_KEYS="1.2:/redblue,1.8:\r,9.0:q" TUI_TIMEOUT=13 tui_run)
+pos=$($PLAYER continue 2>/dev/null | awk '/Redblue/ {gsub(/%/,"",$1); print $1; exit}')
+[ -n "$pos" ] && [ "$pos" -ge 5 ] && [ "$pos" -le 45 ] \
+    && pass "TUI playback saved ${pos}% after ~7 s" \
+    || fail "TUI playback saved '${pos}%', expected roughly 17%"
+
+# ---------------------------------------------------------------- 7. hygiene
 echo
 echo "hygiene"
 # the binary must not leak escape sequences onto stderr

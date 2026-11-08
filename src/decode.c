@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 struct DecodeSource {
@@ -27,6 +28,9 @@ struct DecodeSource {
     size_t frame_bytes;
     int    audio_rate;      /* the rate we resample to (fixed) */
     char  *path;
+    char  *ffmpeg;          /* binary to spawn (kept for re-spawn on seek) */
+    bool   want_v, want_a;
+    double start_at;        /* seconds; passed to ffmpeg as -ss */
 };
 
 /* ------------------------------------------------------------------ */
@@ -210,6 +214,76 @@ static void probe_media(const char *ffmpeg, const char *path, MediaInfo *mi)
     buf_free(&out);
 }
 
+/* Spawn (or re-spawn) the child processes from d->start_at.
+ *
+ * Seeking by re-spawning with "-ss" is deliberate: it is the only way to seek
+ * accurately when decoding is delegated to an external ffmpeg, and it costs one
+ * process start (~10 ms) rather than a decode-from-zero of the whole file.
+ * -ss before -i makes ffmpeg seek the container first, then discard to the
+ * exact frame. */
+static bool spawn_children(DecodeSource *d, char *err, size_t errcap)
+{
+    char ss[64];
+    ss[0] = '\0';
+    if (d->start_at > 0.01) snprintf(ss, sizeof ss, "%.3f", d->start_at);
+
+    if (d->want_v) {
+        char *vf = xmalloc(64);
+        snprintf(vf, 64, "scale=%dx%d", d->w, d->h);
+
+        /* Build argv as a list, then copy into a NULL-terminated array. Never
+         * index into a literal: getting that wrong once invoked ffmpeg with
+         * "-pix_fmt rawvideo" and produced an empty pipe. */
+        const char *a[32];
+        size_t n = 0;
+        a[n++] = d->ffmpeg;
+        a[n++] = "-hide_banner"; a[n++] = "-loglevel"; a[n++] = "error";
+        a[n++] = "-nostdin";
+        if (ss[0]) { a[n++] = "-ss"; a[n++] = ss; }
+        a[n++] = "-i"; a[n++] = d->path;
+        a[n++] = "-an"; a[n++] = "-sn"; a[n++] = "-dn";
+        if (d->start_at <= 0.01) { a[n++] = "-vf"; a[n++] = vf; }
+        a[n++] = "-pix_fmt"; a[n++] = "rgb24";
+        a[n++] = "-f"; a[n++] = "rawvideo";
+        a[n++] = "-";
+        a[n] = NULL;
+
+        char **argv = xcalloc(n + 1, sizeof *argv);
+        for (size_t i = 0; i < n; i++) argv[i] = (char *)a[i];
+
+        d->fd_v = spawn_ffmpeg(d->ffmpeg, argv, &d->pid_v, err, errcap);
+        free(argv);
+        free(vf);
+        if (d->fd_v < 0) return false;
+    }
+
+    if (d->want_a) {
+        char rate[32];
+        snprintf(rate, sizeof rate, "%d", d->audio_rate);
+        const char *a[32];
+        size_t n = 0;
+        a[n++] = d->ffmpeg;
+        a[n++] = "-hide_banner"; a[n++] = "-loglevel"; a[n++] = "error";
+        a[n++] = "-nostdin";
+        if (ss[0]) { a[n++] = "-ss"; a[n++] = ss; }
+        a[n++] = "-i"; a[n++] = d->path;
+        a[n++] = "-vn"; a[n++] = "-sn"; a[n++] = "-dn";
+        a[n++] = "-ac"; a[n++] = "2";
+        a[n++] = "-ar"; a[n++] = rate;
+        a[n++] = "-f"; a[n++] = "s16le";
+        a[n++] = "-";
+        a[n] = NULL;
+
+        char **argv = xcalloc(n + 1, sizeof *argv);
+        for (size_t i = 0; i < n; i++) argv[i] = (char *)a[i];
+
+        d->fd_a = spawn_ffmpeg(d->ffmpeg, argv, &d->pid_a, err, errcap);
+        free(argv);
+        if (d->fd_a < 0 && d->fd_v >= 0) return false;   /* audio is optional */
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* open                                                               */
 /* ------------------------------------------------------------------ */
@@ -243,61 +317,16 @@ DecodeSource *decode_open(const char *path, bool want_video, bool want_audio,
     DecodeSource *d = xcalloc(1, sizeof *d);
     d->fd_v = d->fd_a = -1;
     d->path = xstrdup(path);
-    d->audio_rate = DECODE_AUDIO_RATE;   /* what we ask ffmpeg to produce */
+    d->ffmpeg = xstrdup(out->ffmpeg_path);
+    d->audio_rate = DECODE_AUDIO_RATE;
+    d->want_v = want_video;
+    d->want_a = want_audio;
+    d->start_at = 0;
     d->w = out->src_w > 0 ? out->src_w : 640;
     d->h = out->src_h > 0 ? out->src_h : 360;
     d->frame_bytes = (size_t)d->w * (size_t)d->h * DECODE_BPP;
 
-    if (want_video) {
-        /* Build argv explicitly. Getting this wrong silently breaks ffmpeg (and
-         * with stderr hidden, silently produces an empty pipe), so the argument
-         * list is assembled one entry at a time and asserted to be NULL-safe. */
-        char *vf = xmalloc(64);
-        snprintf(vf, 64, "scale=%dx%d", d->w, d->h);
-
-        const char *a[] = {
-            out->ffmpeg_path,
-            "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", path,
-            "-an", "-sn", "-dn",
-            "-vf", vf,
-            "-pix_fmt", "rgb24",
-            "-f", "rawvideo",
-            "-",
-        };
-        size_t n = sizeof a / sizeof a[0];
-        char **argv = xcalloc(n + 1, sizeof *argv);
-        for (size_t i = 0; i < n; i++) argv[i] = (char *)a[i];
-
-        d->fd_v = spawn_ffmpeg(out->ffmpeg_path, argv, &d->pid_v, err, errcap);
-        free(argv);
-        free(vf);
-        if (d->fd_v < 0) { decode_close(d); return NULL; }
-    }
-
-    if (want_audio) {
-        /* Always resample to the rate the clock assumes, so the audio master
-         * position and our frame arithmetic cannot disagree. */
-        char rate[32];
-        snprintf(rate, sizeof rate, "%d", d->audio_rate);
-        const char *a[] = {
-            out->ffmpeg_path,
-            "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", path,
-            "-vn", "-sn", "-dn",
-            "-ac", "2",
-            "-ar", rate,
-            "-f", "s16le",
-            "-",
-        };
-        size_t n = sizeof a / sizeof a[0];
-        char **argv = xcalloc(n + 1, sizeof *argv);
-        for (size_t i = 0; i < n; i++) argv[i] = (char *)a[i];
-
-        d->fd_a = spawn_ffmpeg(out->ffmpeg_path, argv, &d->pid_a, err, errcap);
-        free(argv);
-        if (d->fd_a < 0 && d->fd_v >= 0) decode_kill(d);   /* audio optional */
-    }
+    if (!spawn_children(d, err, errcap)) { decode_close(d); return NULL; }
 
     return d;
 }
@@ -338,6 +367,7 @@ void decode_close(DecodeSource *d)
     reap(d->pid_v, &d->fd_v);
     reap(d->pid_a, &d->fd_a);
     free(d->path);
+    free(d->ffmpeg);
     free(d);
 }
 
@@ -385,6 +415,20 @@ int decode_read_video(DecodeSource *d, Raster *r)
 
     /* White bar to show end-of-stream trimming: not needed, ffmpeg pads. */
     return 1;
+}
+
+int decode_seek(DecodeSource *d, double seconds, char *err, size_t errcap)
+{
+    if (!d) return -1;
+    if (seconds < 0) seconds = 0;
+
+    reap(d->pid_v, &d->fd_v);
+    reap(d->pid_a, &d->fd_a);
+    d->ended_v = d->ended_a = false;
+    d->start_at = seconds;
+
+    if (!spawn_children(d, err, errcap)) return -1;
+    return 0;
 }
 
 ssize_t decode_read_audio(DecodeSource *d, int16_t *buf, size_t max_samples)

@@ -13,12 +13,15 @@
 #include "decode.h"
 #include "gfx.h"
 #include "session.h"
+#include "tui.h"
+#include "library.h"
 #include "term.h"
 #include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define VERSION "0.1.0"
 
@@ -28,7 +31,10 @@ static void usage(FILE *f)
 "player " VERSION " - a terminal media player\n"
 "\n"
 "USAGE\n"
-"  player [FILE] [options]     play a video or audio file\n"
+"  player                      open the library (the interactive player)\n"
+"  player FILE [options]       play one file, no library chrome\n"
+"  player add DIR              add a folder to the library and index it\n"
+"  player list [FILTER]        print the library as plain text\n"
 "  player testsrc [options]    play a synthetic test pattern (no media needed)\n"
 "  player probe                show terminal capabilities and the backend ladder\n"
 "  player doctor               diagnose playback problems and say what to fix\n"
@@ -43,6 +49,7 @@ static void usage(FILE *f)
 "      --fps N          target frame rate (default 30)\n"
 "      --no-audio       decode video only\n"
 "      --no-video       decode audio only\n"
+"      --no-resume      ignore the saved position, start at 0\n"
 "      --loop           restart when the file ends\n"
 "      --stats          show a live statistics line\n"
 "  -q, --quiet          no HUD, no alternate screen (for pipes and scripts)\n"
@@ -176,6 +183,108 @@ static void print_backends(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* library subcommands                                                */
+/* ------------------------------------------------------------------ */
+
+static void data_dir_path(char *out, size_t cap)
+{
+    const char *env = getenv("TERMIPLAYER_DATA");
+    if (env && *env) { snprintf(out, cap, "%s", env); return; }
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) { snprintf(out, cap, "%s/termiplayer", xdg); return; }
+    const char *home = getenv("HOME");
+    if (home && *home) { snprintf(out, cap, "%s/.local/share/termiplayer", home); return; }
+    snprintf(out, cap, "./.termiplayer");
+}
+
+static Library *open_library(void)
+{
+    char ddir[1024];
+    data_dir_path(ddir, sizeof ddir);
+    char ff[512];
+    const char *why = NULL;
+    const char *f = decode_find_ffmpeg(ff, sizeof ff, &why);
+    return lib_open(ddir, f);
+}
+
+static void scan_quiet(void *ctx, int found, const char *path, bool probing)
+{
+    (void)ctx; (void)path;
+    if (!probing) {
+        fprintf(stderr, "\r  %d files found...\r", found);
+        fflush(stderr);
+    }
+}
+
+static int cmd_add_do(const char *dir)
+{
+    Library *l = open_library();
+    if (!lib_add_folder(l, dir)) {
+        fprintf(stderr, "player: not a directory: %s\n", dir);
+        lib_close(l);
+        return 1;
+    }
+    fprintf(stderr, "scanning %s\n", dir);
+    int n = lib_scan(l, scan_quiet, NULL);
+    int v = 0, a = 0;
+    double h = 0;
+    lib_stats(l, &v, &a, &h);
+    fprintf(stderr, "\rindexed %d files (%d found in this scan): %d video, %d audio, %.1f h total\n",
+            lib_count(l), n, v, a, h);
+    lib_close(l);
+    return 0;
+}
+
+static int cmd_list_do(const char *filter)
+{
+    Library *l = open_library();
+    if (lib_count(l) == 0) {
+        fprintf(stderr, "library is empty. Try: player add ~/Videos\n");
+        lib_close(l);
+        return 1;
+    }
+    int n = 0;
+    int *idx = lib_filter(l, filter, &n);
+    for (int i = 0; i < n; i++) {
+        const Entry *e = lib_at(l, idx[i]);
+        char dur[24];
+        if (e->duration > 0) fmt_time(dur, sizeof dur, e->duration);
+        else                 snprintf(dur, sizeof dur, "--:--");
+        char mark = e->watched >= 0.97 ? '*' : (e->position > 5.0 ? '+' : ' ');
+        printf("%c %-8s %-6s %s\n", mark, dur,
+               e->kind == MK_AUDIO ? "audio" : "video",
+               e->title ? e->title : e->path);
+    }
+    free(idx);
+    lib_close(l);
+    return 0;
+}
+
+static int cmd_continue_do(void)
+{
+    Library *l = open_library();
+    int n = 0;
+    int *idx = lib_continue_watching(l, &n);
+    if (!n) {
+        printf("nothing in progress\n");
+        free(idx);
+        lib_close(l);
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        const Entry *e = lib_at(l, idx[i]);
+        char pos[24], dur[24];
+        fmt_time(pos, sizeof pos, e->position);
+        fmt_time(dur, sizeof dur, e->duration);
+        printf("%3d%%  %s / %s  %s\n", (int)(e->watched * 100), pos, dur,
+               e->title ? e->title : e->path);
+    }
+    free(idx);
+    lib_close(l);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -189,6 +298,9 @@ int main(int argc, char **argv)
     const char *file = NULL;
     bool want_probe = false, want_doctor = false, want_backends = false;
     bool want_help = false, want_version = false;
+    bool want_tui = false;
+    const char *cmd_add = NULL, *cmd_list = NULL;
+    bool cmd_continue = false;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -200,6 +312,17 @@ int main(int argc, char **argv)
         if (!strcmp(a, "doctor")) { want_doctor = true; continue; }
         if (!strcmp(a, "backends")) { want_backends = true; continue; }
         if (!strcmp(a, "testsrc")) { o.testsrc = true; continue; }
+        if (!strcmp(a, "add")) {
+            if (!next) die("add needs a directory");
+            cmd_add = next; i++; continue;
+        }
+        if (!strcmp(a, "list")) {
+            cmd_list = (next && next[0] != '-') ? next : "";
+            if (next && next[0] != '-') i++;
+            continue;
+        }
+        if (!strcmp(a, "continue") || !strcmp(a, "resume")) { cmd_continue = true; continue; }
+        if (!strcmp(a, "tui") || !strcmp(a, "browse")) { want_tui = true; continue; }
 
         if (!strcmp(a, "-b") || !strcmp(a, "--backend")) {
             if (!next) die("%s needs a value", a);
@@ -232,6 +355,8 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--no-video")) { o.no_video = true; continue; }
         if (!strcmp(a, "--loop"))     { o.loop = true; continue; }
         if (!strcmp(a, "--stats"))    { o.stats = true; continue; }
+        if (!strcmp(a, "--no-resume")) { o.no_resume = true; continue; }
+        if (!strcmp(a, "--from-start")) { o.no_resume = true; continue; }
         if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) { o.quiet = true; continue; }
 
         if (a[0] == '-' && a[1] != '\0') die("unknown option '%s' (try --help)", a);
@@ -241,11 +366,38 @@ int main(int argc, char **argv)
 
     if (want_version) { printf("player %s\n", VERSION); return 0; }
     if (want_help) { usage(stdout); return 0; }
+    if (cmd_add)      return cmd_add_do(cmd_add);
+    if (cmd_list)     return cmd_list_do(cmd_list);
+    if (cmd_continue) return cmd_continue_do();
     if (want_probe) { print_probe(); return 0; }
     if (want_doctor) { print_doctor(); return 0; }
     if (want_backends) { print_backends(); return 0; }
 
-    if (!o.testsrc && !file) { usage(stderr); return 2; }
+    if (!o.testsrc && !file) {
+        /* No file and no subcommand: this is the player itself. On a terminal
+         * that means the library; when piped, fall back to usage. */
+        TuiOpts to;
+        memset(&to, 0, sizeof to);
+        to.start_path = NULL;
+        to.force_backend = o.force_backend;
+        to.target_fps = o.target_fps;
+        to.no_audio = o.no_audio;
+        to.no_video = o.no_video;
+        to.stats = o.stats;
+        if (!isatty(0) || !isatty(1)) { usage(stderr); return 2; }
+        return tui_run(&to);
+    }
+    if (want_tui) {
+        TuiOpts to;
+        memset(&to, 0, sizeof to);
+        to.start_path = file;
+        to.force_backend = o.force_backend;
+        to.target_fps = o.target_fps;
+        to.no_audio = o.no_audio;
+        to.no_video = o.no_video;
+        to.stats = o.stats;
+        return tui_run(&to);
+    }
     if (o.testsrc) { o.testsrc_seconds = 10; o.no_audio = true; }
     o.path = file;
 

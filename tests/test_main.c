@@ -13,8 +13,13 @@
 #include "testsrc.h"
 #include "throughput.h"
 #include "util.h"
+#include "media.h"
+#include "library.h"
+#include "screen.h"
 
 #include <math.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 static Raster make_raster(int w, int h)
@@ -479,6 +484,241 @@ static void test_term(void)
     buf_free(&w.b);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* media: release-name parsing                                        */
+/* ------------------------------------------------------------------ */
+
+/* Every one of these strings came from a real file name that was rendered
+ * wrong at some point. Title parsing is the difference between a library that
+ * looks like a dump of the filesystem and one that looks like a library, so it
+ * gets regression cases rather than a single "it works" check. */
+static void test_media_titles(void)
+{
+    struct { const char *in, *want; } cases[] = {
+        { "/m/Dune.2021.1080p.WEB-DL.x264-GROUP.mkv", "Dune 2021" },
+        { "/m/the.matrix.1999.2160p.UHD.BluRay.REMUX.HEVC.Atmos-TERMiNAL.mkv",
+          "The Matrix 1999" },
+        { "/m/Blade Runner 2049 (2017) [1080p] [YTS.AG].mp4", "Blade Runner 2049" },
+        { "/m/01 - Test Artist - A Song.mp3", "A Song" },
+        { "/m/Pink Floyd - Comfortably Numb.flac", "Comfortably Numb" },
+        { "/m/Some.Movie.2019.720p.BRRip.x264.AAC-OzR.mkv", "Some Movie 2019" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        char *got = media_pretty_title(cases[i].in);
+        CHECK_MSG(got && !strcmp(got, cases[i].want),
+                  "%s -> \"%s\" (want \"%s\")", cases[i].in, got ? got : "(null)",
+                  cases[i].want);
+        free(got);
+    }
+
+    /* the artist split must not eat the title when there is no separator */
+    char *pretty = media_pretty_title("/m/Dune.2021.1080p.WEB-DL.x264-GROUP.mkv");
+    char *artist = NULL, *title = NULL;
+    media_split_artist(pretty, &artist, &title);
+    CHECK_MSG(title && !strcmp(title, "Dune 2021"), "split title keeps the name");
+    free(pretty); free(artist); free(title);
+}
+
+static void test_media_kinds(void)
+{
+    CHECK_EQ_INT(media_ext_kind("a.mkv"), MK_VIDEO);
+    CHECK_EQ_INT(media_ext_kind("a.MP4"), MK_VIDEO);
+    CHECK_EQ_INT(media_ext_kind("a.flac"), MK_AUDIO);
+    CHECK_EQ_INT(media_ext_kind("a.ogg"), MK_AUDIO);
+    CHECK_EQ_INT(media_ext_kind("a.txt"), MK_UNKNOWN);
+    CHECK(media_ext_known("x.mkv"));
+    CHECK(!media_ext_known("x.txt"));
+    /* a dotfile with no extension must not look like one */
+    CHECK(!media_ext_known("/tmp/.hidden"));
+}
+
+/* ------------------------------------------------------------------ */
+/* library: persistence and views                                     */
+/* ------------------------------------------------------------------ */
+
+static void test_library(void)
+{
+    char dir[] = "/tmp/tp-test-lib-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+
+    Library *l = lib_open(dir, NULL);      /* NULL ffmpeg: no probing, fine */
+    CHECK(l != NULL);
+    CHECK_EQ_INT(lib_count(l), 0);
+
+    /* a state line for a file that was never indexed must still be loaded:
+     * this is the "player movie.mkv" path, and dropping it broke resume for
+     * every file outside a watched folder. */
+    char st[512];
+    snprintf(st, sizeof st, "%s/state.tsv", dir);
+    FILE *f = fopen(st, "wb");
+    CHECK(f != NULL);
+    fprintf(f, "# termiplayer state v1\nS\t/tmp/outside.mp4\t42.500\t0.3100\t1700000000\n");
+    fclose(f);
+
+    lib_close(l);
+    l = lib_open(dir, NULL);
+    Entry *e = lib_find(l, "/tmp/outside.mp4");
+    CHECK_MSG(e != NULL, "state for an unindexed file is loaded");
+    if (e) {
+        CHECK_NEAR(e->position, 42.5, 0.001);
+        CHECK_NEAR(e->watched, 0.31, 0.001);
+    }
+
+    /* position updates round-trip through an atomic write */
+    if (e) lib_set_position(l, e, 10.0, 100.0);
+    lib_flush(l);
+    lib_close(l);
+    l = lib_open(dir, NULL);
+    e = lib_find(l, "/tmp/outside.mp4");
+    CHECK(e != NULL && fabs(e->position - 10.0) < 0.01);
+
+    /* lib_touch creates entries, and is idempotent */
+    int before = lib_count(l);
+    Entry *t1 = lib_touch(l, "/tmp/new.mkv");
+    Entry *t2 = lib_touch(l, "/tmp/new.mkv");
+    CHECK(t1 && t1 == t2);
+    CHECK_EQ_INT(lib_count(l), before + 1);
+
+    /* no temp files left behind by the atomic write */
+    char tmpname[600];
+    snprintf(tmpname, sizeof tmpname, "%s/state.tsv.tmp", dir);
+    struct stat sb;
+    CHECK_MSG(stat(tmpname, &sb) != 0, "atomic write cleans up its temp file");
+
+    lib_close(l);
+
+    /* corrupt / truncated files must not crash or hang */
+    f = fopen(st, "wb");
+    fprintf(f, "S\t\t\t\n\nF\t\nI\tonly-three\t1\t9\n");
+    fclose(f);
+    l = lib_open(dir, NULL);
+    CHECK_MSG(l != NULL, "survives a malformed state file");
+    lib_close(l);
+}
+
+static void test_library_paths(void)
+{
+    /* paths with spaces and tabs must survive a save/load round trip: tabs are
+     * the field separator, so they have to be escaped. */
+    char dir[] = "/tmp/tp-test-path-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    Library *l = lib_open(dir, NULL);
+    Entry *e = lib_touch(l, "/tmp/a b/c\td.mkv");
+    CHECK(e != NULL);
+    if (e) lib_set_position(l, e, 5.0, 50.0);
+    lib_flush(l);
+    lib_close(l);
+
+    l = lib_open(dir, NULL);
+    e = lib_find(l, "/tmp/a b/c\td.mkv");
+    CHECK_MSG(e != NULL, "path with a tab survives the round trip");
+    lib_close(l);
+}
+
+/* ------------------------------------------------------------------ */
+/* screen: the diff renderer                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_screen(void)
+{
+    Screen s;
+    screen_init(&s, 40, 10);
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+
+    /* drawing text lands in the right cells with the right glyphs */
+    int n = screen_text(&s, 2, 3, 10, "hi", 0xFF0000, 0x101010, A_NONE);
+    CHECK_EQ_INT(n, 2);
+    CHECK_EQ_INT(s.cur[3 * s.w + 2].ch, 'h');
+    CHECK_EQ_INT(s.cur[3 * s.w + 3].ch, 'i');
+    CHECK_EQ_INT(s.cur[3 * s.w + 2].fg, 0xFF0000);
+
+    /* text must be clipped to maxw, not overflow into the next field */
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_text(&s, 0, 0, 3, "abcdef", 0xFFFFFF, 0, A_NONE);
+    CHECK_EQ_INT(s.cur[2].ch, 'c');
+    CHECK_MSG(s.cur[3].ch == ' ', "text stops at maxw");
+
+    /* screen_text_right ellipsizes and must NOT blank the area to its left:
+     * padding with spaces there erased content already drawn on that row. */
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_text(&s, 0, 0, 20, "ABCDEFGHIJKLMN", 0xFFFFFF, 0, A_NONE);
+    screen_text_right(&s, 10, 0, 6, "xyz", 0xFFFFFF, 0, A_NONE);
+    CHECK_EQ_INT(s.cur[0].ch, 'A');
+    CHECK_MSG(s.cur[5].ch == 'F', "cell left of a right-aligned run is untouched");
+    /* width 6 at x=10 holds cells 10..15; "xyz" is 3 wide, so it starts at 13 */
+    CHECK_EQ_INT(s.cur[13].ch, 'x');
+    CHECK_MSG(s.cur[12].ch == 'M', "the cell just before the run is untouched");
+    CHECK_EQ_INT(s.cur[15].ch, 'z');
+
+    /* a long string is truncated, and the truncation is visible */
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_text_right(&s, 0, 0, 5, "abcdefghij", 0xFFFFFF, 0, A_NONE);
+    CHECK_EQ_INT(s.cur[4].ch, 0x2026);   /* clipped at the end, ellipsis there */
+    CHECK_EQ_INT(s.cur[0].ch, 'a');      /* and the start is preserved */
+
+    /* geometry: a box occupies exactly its corners */
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_box(&s, 1, 1, 8, 4, 0x888888, 0x000000);
+    CHECK_EQ_INT(s.cur[1 * s.w + 1].ch, 0x250C);        /* ┌ */
+    CHECK_EQ_INT(s.cur[1 * s.w + 8].ch, 0x2510);        /* ┐ */
+    CHECK_EQ_INT(s.cur[4 * s.w + 1].ch, 0x2514);        /* └ */
+    CHECK_EQ_INT(s.cur[2 * s.w + 1].ch, 0x2502);        /* │ */
+    CHECK_MSG(s.cur[1 * s.w + 9].ch == ' ', "box does not bleed past its width");
+
+    /* the bar fills proportionally and clamps out-of-range fractions */
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_bar(&s, 0, 0, 10, 0.5, 0xFFFFFF, 0x444444, 0x101010);
+    int filled = 0;
+    for (int x = 0; x < 10; x++)
+        if (s.cur[x].fg == 0xFFFFFF) filled++;
+    CHECK_MSG(filled >= 4 && filled <= 6, "half-filled bar fills about half (%d)", filled);
+
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_bar(&s, 0, 0, 10, 5.0, 0xFFFFFF, 0x444444, 0x101010);   /* way over */
+    screen_bar(&s, 0, 0, 10, -3.0, 0xFFFFFF, 0x444444, 0x101010);  /* negative */
+    CHECK_MSG(1, "out-of-range bar fractions do not crash");
+
+    screen_free(&s);
+}
+
+/* The diff promise: a flush after no changes emits (almost) nothing. And a
+ * flush after one change emits that change, not the whole screen. */
+static void test_screen_diff(void)
+{
+    Screen s;
+    screen_init(&s, 40, 12);
+    TtyWriter w;
+    ttyw_init(&w, -1);
+
+    screen_clear(&s, 0xFFFFFF, 0x000000);
+    screen_text(&s, 0, 0, 40, "hello", 0xFFFFFF, 0, A_NONE);
+    screen_flush(&s, &w, true, true);      /* first paint is necessarily full */
+    size_t full = w.b.len;
+    CHECK(full > 100);
+
+    w.b.len = 0;
+    screen_flush(&s, &w, true, false);     /* nothing changed */
+    CHECK_MSG(w.b.len < full / 4, "unchanged frame is cheap (%zu vs %zu)",
+              w.b.len, full);
+
+    w.b.len = 0;
+    static const char X_CH = 'X';
+    screen_text(&s, 20, 5, 40, "X", 0x00FF00, 0x000000, A_NONE);
+    screen_flush(&s, &w, true, false);
+    CHECK_MSG(w.b.len < full / 3, "one changed cell moves few bytes (%zu)", w.b.len);
+    CHECK_MSG(memchr(w.b.p, X_CH, w.b.len) != NULL, "the changed cell is emitted");
+
+    /* a resize must invalidate the whole diff cache, or the screen tears */
+    w.b.len = 0;
+    screen_resize(&s, 50, 15);
+    screen_flush(&s, &w, true, false);
+    CHECK_MSG(w.b.len > 0, "resize forces a repaint");
+
+    buf_free(&w.b);
+    screen_free(&s);
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -492,5 +732,11 @@ int main(void)
     test_throughput();
     test_testsrc();
     test_term();
+    test_media_titles();
+    test_media_kinds();
+    test_library();
+    test_library_paths();
+    test_screen();
+    test_screen_diff();
     return test_report();
 }
