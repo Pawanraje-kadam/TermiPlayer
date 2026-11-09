@@ -142,7 +142,12 @@ FF="${TERMIPLAYER_FFMPEG:-$(command -v ffmpeg || true)}"
 if [ -z "$FF" ]; then
     FF=$(./player doctor 2>/dev/null | sed -n 's/.*ffmpeg at //p' | head -1)
 fi
-if [ -z "$FF" ] || [ ! -f "$FIX/clip.mp4" ]; then
+MEDIA_READY=1
+for fixture in clip.mp4 busy.mp4 tone.flac redblue.mp4; do
+    [ -f "$FIX/$fixture" ] || MEDIA_READY=0
+done
+[ -n "$FF" ] || MEDIA_READY=0
+if [ "$MEDIA_READY" -eq 0 ]; then
     skip "ffmpeg or fixtures unavailable (run: sh tools/mkfixtures.sh)"
 else
     export TERMIPLAYER_FFMPEG="$FF"
@@ -194,6 +199,7 @@ echo "library and resume"
 export TERMIPLAYER_DATA="$TMP/data"
 rm -rf "$TERMIPLAYER_DATA"
 
+if [ "$MEDIA_READY" -eq 1 ]; then
 run $PLAYER add "$FIX" >/dev/null 2>&1
 [ $? -eq 0 ] && pass "add indexes a folder" || fail "add failed"
 [ -f "$TMP/data/index.tsv" ] && pass "index file written" \
@@ -259,6 +265,10 @@ c30=$(dom_colour -t 30)
 $PLAYER "$FIX/redblue.mp4" --no-resume -b ascii -q -s 8x4 -d 0.2 >/dev/null 2>&1
 [ $? -eq 0 ] && pass "--no-resume bypasses the saved position" || fail "--no-resume failed"
 
+else
+    skip "library playback and resume require ffmpeg and fixtures (run: sh tools/mkfixtures.sh)"
+fi
+
 # the player must refuse to start the TUI without a tty rather than hang
 timeout 10 $PLAYER tui < /dev/null > "$TMP/tui.out" 2>"$TMP/tui.err"
 rc=$?
@@ -323,24 +333,28 @@ esac
 # Playback in the TUI must run at real time and persist a resume point. This is
 # the test that catches the pacing bug: the pane used to burn through the whole
 # file in a couple of seconds and mark it watched.
+if [ "$MEDIA_READY" -eq 1 ]; then
 out=$(TUI_KEYS="1.2:/redblue,1.8:\r,9.0:q" TUI_TIMEOUT=13 tui_run)
 pos=$($PLAYER continue 2>/dev/null | awk '/Redblue/ {gsub(/%/,"",$1); print $1; exit}')
 [ -n "$pos" ] && [ "$pos" -ge 5 ] && [ "$pos" -le 45 ] \
     && pass "TUI playback saved ${pos}% after ~7 s" \
     || fail "TUI playback saved '${pos}%', expected roughly 17%"
+else
+    skip "TUI playback requires ffmpeg and fixtures (run: sh tools/mkfixtures.sh)"
+fi
 
 # ---------------------------------------------------------------- 7. hygiene
 echo
 echo "hygiene"
 # the binary must not leak escape sequences onto stderr
-if grep -q $'\033' "$TMP/err" 2>/dev/null; then
+if grep -q "$(printf '\033')" "$TMP/err" 2>/dev/null; then
     fail "escape sequences leaked to stderr"
 else
     pass "nothing but text on stderr"
 fi
 
 # stdout of a --version must be plain
-$PLAYER --version | grep -q $'\033' && fail "--version emitted escapes" \
+$PLAYER --version | grep -q "$(printf '\033')" && fail "--version emitted escapes" \
     || pass "--version is plain text"
 
 echo
