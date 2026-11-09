@@ -54,7 +54,8 @@ const char *lib_folder(const Library *l, int i);
 
 /* Rescan the watch list. `progress` is called with (files_seen, current_path)
  * so the UI can show what it is doing. Reuses cached durations when a file's
- * (mtime, size) is unchanged. Returns the number of files indexed. */
+ * (mtime, size) is unchanged. Directory symlinks are not traversed; file
+ * symlinks resolve to their targets. Returns the number of files encountered. */
 typedef void (*ScanProgress)(void *ctx, int found, const char *path, bool probing);
 int lib_scan(Library *l, ScanProgress progress, void *ctx);
 

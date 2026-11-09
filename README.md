@@ -53,8 +53,12 @@ and for audio *decoding*. Audio *output* needs nothing: it uses libpulse via
 ```bash
 make test            # 200 unit + 40 integration checks
 make test-san        # the same, under ASan + UBSan
-sh tools/mkfixtures.sh   # generate the test media (needs ffmpeg)
+sh tools/mkfixtures.sh   # generate the test media (needs ffmpeg with libx264)
 ```
+
+The integration suite also needs Python 3 and `timeout`. On a fresh checkout,
+media-dependent checks are skipped until FFmpeg and the generated fixtures are
+available; run `make fixtures && make test` to exercise playback and resume.
 
 ---
 

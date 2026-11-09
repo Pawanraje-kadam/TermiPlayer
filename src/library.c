@@ -361,14 +361,13 @@ void lib_flush(Library *l)
 bool lib_add_folder(Library *l, const char *dir)
 {
     if (l->nfolders >= MAX_FOLDERS || !dir || !*dir) return false;
-    for (int i = 0; i < l->nfolders; i++)
-        if (strcmp(l->folders[i], dir) == 0) return true;
-
     char resolved[4096];
     const char *use = dir;
     if (realpath(dir, resolved)) use = resolved;
 
     if (!is_dir(use)) return false;
+    for (int i = 0; i < l->nfolders; i++)
+        if (strcmp(l->folders[i], use) == 0) return true;
     l->folders[l->nfolders++] = xstrdup(use);
     l->dirty = true;
     lib_flush(l);
@@ -447,24 +446,37 @@ static int scan_dir(Library *l, const char *dir, ScanProgress cb, void *ctx,
         char *full = path_join(dir, names[i]);
         struct stat st;
 
-        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-            if (!skip_dir(names[i]))
+        /* Do not follow directory symlinks: they can create cycles or cause
+         * an unexpectedly large scan outside the watched tree. File symlinks
+         * are allowed and indexed by their canonical target. */
+        struct stat lst;
+        if (lstat(full, &lst) != 0 || stat(full, &st) != 0) {
+            free(full);
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (!S_ISLNK(lst.st_mode) && !skip_dir(names[i]))
                 found = scan_dir(l, full, cb, ctx, found, depth + 1, probed);
             free(full);
             continue;
         }
-        if (!media_ext_known(full)) { free(full); continue; }
+        if (!S_ISREG(st.st_mode) || !media_ext_known(full)) { free(full); continue; }
 
-        Entry *e = lib_find(l, full);
+        char *canonical = canon_path(full);
+        Entry *e = lib_find(l, canonical);
         if (!e) {
-            e = entry_new(l, full);
-            l->dirty = true;
-        } else {
-            /* refresh the cheap stat, keep the cached duration */
+            e = entry_new(l, canonical);
+            if (e) l->dirty = true;
+        } else if (e->mtime != (int64_t)st.st_mtime || e->size != (int64_t)st.st_size) {
+            /* A changed file must be probed again, not keep stale duration. */
             e->mtime = (int64_t)st.st_mtime;
             e->size = (int64_t)st.st_size;
+            e->duration = 0;
             e->kind = media_ext_kind(full);
+            l->dirty = true;
         }
+        free(canonical);
+        if (!e) { free(full); continue; }
         found++;
 
         if (cb && (found % 8) == 0) cb(ctx, found, full, false);
@@ -535,9 +547,7 @@ void lib_set_position(Library *l, Entry *e, double seconds, double duration)
 
     /* Debounce: the playback loop calls this often. Persist at most every 3 s. */
     if (now_ns() - l->last_save_ns > 3000000000LL) {
-        save_state(l);
-        l->last_save_ns = now_ns();
-        l->dirty = false;
+        lib_flush(l);
     }
 }
 

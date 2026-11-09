@@ -66,6 +66,6 @@ install: all
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 
 clean:
-	rm -rf $(BUILD) $(TARGET) tests/run tests/*.o tests/fixtures/*.tmp
+	rm -rf $(BUILD) $(TARGET) tests/run tests/run.bin tests/*.o tests/fixtures/*.tmp
 
 -include $(DEPS)

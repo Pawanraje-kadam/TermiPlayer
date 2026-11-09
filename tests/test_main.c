@@ -616,6 +616,54 @@ static void test_library_paths(void)
     lib_close(l);
 }
 
+static void test_library_scan(void)
+{
+    char dir[] = "/tmp/tp-test-scan-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char data[512], file[512], alias[512], loop[512], missing[512];
+    snprintf(data, sizeof data, "%s/data", dir);
+    snprintf(file, sizeof file, "%s/movie.mp4", dir);
+    snprintf(alias, sizeof alias, "%s/alias.mp4", dir);
+    snprintf(loop, sizeof loop, "%s/loop", dir);
+    snprintf(missing, sizeof missing, "%s/missing.mp4", dir);
+    FILE *f = fopen(file, "w");
+    CHECK(f != NULL);
+    if (f) { fputs("one", f); fclose(f); }
+    CHECK(symlink(file, alias) == 0);
+    CHECK(symlink(dir, loop) == 0);
+    CHECK(symlink("no-such-file", missing) == 0);
+
+    Library *l = lib_open(data, NULL);
+    CHECK(l != NULL);
+    CHECK(lib_add_folder(l, dir));
+    char relative[512];
+    snprintf(relative, sizeof relative, "%s/.", dir);
+    CHECK(lib_add_folder(l, relative));
+    CHECK_EQ_INT(lib_folder_count(l), 1);
+    CHECK_EQ_INT(lib_scan(l, NULL, NULL), 2);
+    CHECK_EQ_INT(lib_count(l), 1);
+    Entry *e = lib_find(l, file);
+    CHECK(e != NULL && e == lib_find(l, alias));
+    if (e) e->duration = 123.0;
+    f = fopen(file, "a");
+    CHECK(f != NULL);
+    if (f) { fputs("changed", f); fclose(f); }
+    lib_scan(l, NULL, NULL);
+    e = lib_find(l, file);
+    CHECK(e != NULL && e->duration == 0 && e->size == 10);
+    lib_close(l);
+    l = lib_open(data, NULL);
+    e = lib_find(l, file);
+    CHECK(e != NULL && e->duration == 0 && e->size == 10);
+    lib_close(l);
+
+    unlink(missing); unlink(loop); unlink(alias); unlink(file);
+    char index[512], state[512];
+    snprintf(index, sizeof index, "%s/data/index.tsv", dir);
+    snprintf(state, sizeof state, "%s/data/state.tsv", dir);
+    unlink(index); unlink(state); rmdir(data); rmdir(dir);
+}
+
 /* ------------------------------------------------------------------ */
 /* screen: the diff renderer                                          */
 /* ------------------------------------------------------------------ */
@@ -736,6 +784,7 @@ int main(void)
     test_media_kinds();
     test_library();
     test_library_paths();
+    test_library_scan();
     test_screen();
     test_screen_diff();
     return test_report();
